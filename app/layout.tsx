@@ -16,6 +16,10 @@ export const metadata: Metadata = {
   title: "Artemis — No-Code Robotics AI Platform",
   description:
     "Train, test, and deploy AI models to robots — without writing a single line of code. Artemis makes robotics accessible to everyone.",
+  icons: {
+    icon: "/artemis-logo.png",
+    apple: "/artemis-logo.png",
+  },
 };
 
 export default function RootLayout({
