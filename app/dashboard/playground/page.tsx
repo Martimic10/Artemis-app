@@ -4,200 +4,404 @@ import { useState, useEffect, useRef, useCallback } from "react";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
-type SimState = "idle" | "running" | "paused";
+type RobotState = "idle" | "moving" | "reached";
 
-interface SceneObject {
-  id: number; label: string; confidence: number;
-  x: number; y: number; w: number; h: number;
-  cls: string;
+interface SimObject {
+  id: number;
+  x: number;
+  y: number;
+  radius: number;
+  label: string;
+  color: string;
+  confidence: number;
+  detected: boolean;
 }
-
-interface Rule { id: number; condition: string; action: string; }
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const CLS_COLOR: Record<string, string> = {
-  object:    "#22d3ee",
-  person:    "#f87171",
-  vehicle:   "#fbbf24",
-  furniture: "#a78bfa",
-  nature:    "#4ade80",
-};
+const ROBOT_RADIUS  = 18;
+const ROBOT_SPEED   = 110; // px/s
+const OBJECT_LABELS = ["Box", "Bottle", "Ball", "Cube", "Cylinder", "Sphere"];
+const OBJECT_COLORS = ["#22d3ee", "#f87171", "#fbbf24", "#a78bfa", "#4ade80", "#fb923c"];
 
-const MODELS = [
-  { id: "od-v2",   name: "Object Detection v2", type: "Detection",    accuracy: "94.2%" },
-  { id: "nav-v1",  name: "Navigation v1",        type: "Navigation",   accuracy: "89.7%" },
-  { id: "grip-v1", name: "Grip Controller",       type: "Manipulation", accuracy: "91.5%" },
-];
+// ── Canvas helpers ────────────────────────────────────────────────────────────
 
-const SCENES: Record<string, SceneObject[]> = {
-  Warehouse: [
-    { id: 1, label: "Box",      confidence: 94, x: 12, y: 28, w: 16, h: 22, cls: "object"  },
-    { id: 2, label: "Pallet",   confidence: 87, x: 54, y: 52, w: 24, h: 16, cls: "object"  },
-    { id: 3, label: "Forklift", confidence: 76, x: 70, y: 15, w: 22, h: 40, cls: "vehicle" },
-    { id: 4, label: "Person",   confidence: 91, x: 36, y: 10, w: 10, h: 32, cls: "person"  },
-    { id: 5, label: "Bottle",   confidence: 82, x: 26, y: 60, w:  6, h: 16, cls: "object"  },
-  ],
-  Kitchen: [
-    { id: 1, label: "Bottle", confidence: 92, x: 18, y: 38, w:  8, h: 22, cls: "object" },
-    { id: 2, label: "Cup",    confidence: 88, x: 55, y: 42, w: 10, h: 16, cls: "object" },
-    { id: 3, label: "Person", confidence: 95, x: 66, y:  8, w: 14, h: 40, cls: "person" },
-    { id: 4, label: "Plate",  confidence: 79, x: 38, y: 60, w: 18, h: 10, cls: "object" },
-  ],
-  Office: [
-    { id: 1, label: "Laptop", confidence: 96, x: 28, y: 44, w: 22, h: 15, cls: "object"    },
-    { id: 2, label: "Chair",  confidence: 83, x: 62, y: 28, w: 18, h: 38, cls: "furniture" },
-    { id: 3, label: "Person", confidence: 89, x: 14, y:  6, w: 12, h: 34, cls: "person"    },
-    { id: 4, label: "Phone",  confidence: 91, x: 48, y: 56, w:  8, h: 12, cls: "object"    },
-  ],
-  Outdoor: [
-    { id: 1, label: "Car",    confidence: 93, x: 44, y: 32, w: 28, h: 22, cls: "vehicle" },
-    { id: 2, label: "Person", confidence: 88, x: 18, y: 18, w: 10, h: 32, cls: "person"  },
-    { id: 3, label: "Cone",   confidence: 85, x: 66, y: 52, w:  8, h: 16, cls: "object"  },
-    { id: 4, label: "Tree",   confidence: 77, x:  6, y:  4, w: 16, h: 48, cls: "nature"  },
-  ],
-};
-
-const SCENE_BG: Record<string, string> = {
-  Warehouse: "radial-gradient(ellipse at 50% 30%, #161610 0%, #0e0e0a 55%, #080808 100%)",
-  Kitchen:   "radial-gradient(ellipse at 50% 30%, #14141a 0%, #0e0e12 55%, #080808 100%)",
-  Office:    "radial-gradient(ellipse at 50% 30%, #111118 0%, #0c0c14 55%, #080808 100%)",
-  Outdoor:   "radial-gradient(ellipse at 40% 25%, #0e1318 0%, #0a0e12 55%, #080808 100%)",
-};
-
-const CONDITIONS = [
-  "Bottle detected", "Cup detected", "Person detected",
-  "Box detected", "Car detected", "Any object detected",
-];
-const ACTIONS = ["Move toward", "Pick up", "Avoid", "Track", "Stop", "Report position"];
-
-const STATUS_STEPS = [
-  "Initializing sensors...",
-  "Scanning environment...",
-  "Analyzing frame...",
-  "Object detected",
-  "Target acquired",
-  "Calculating path...",
-  "Moving toward object",
-  "Approach confirmed",
-  "Awaiting next command...",
-];
-
-const ROBOT_POS: [number, number] = [50, 83];
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-function findTarget(objects: SceneObject[], rules: Rule[]): SceneObject | null {
-  for (const rule of rules) {
-    const label = rule.condition.split(" ")[0];
-    if (label === "Any") return objects[0];
-    const match = objects.find(o => o.label.toLowerCase() === label.toLowerCase());
-    if (match) return match;
-  }
-  return objects[0] ?? null;
+function hexToRgb(hex: string) {
+  const r = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+  if (!r) return "255,255,255";
+  return `${parseInt(r[1], 16)},${parseInt(r[2], 16)},${parseInt(r[3], 16)}`;
 }
 
-// ── Page ──────────────────────────────────────────────────────────────────────
+function drawGrid(ctx: CanvasRenderingContext2D, w: number, h: number) {
+  ctx.save();
+  ctx.strokeStyle = "rgba(34,211,238,0.04)";
+  ctx.lineWidth = 1;
+  const step = 44;
+  for (let x = 0; x <= w; x += step) {
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
+  }
+  for (let y = 0; y <= h; y += step) {
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawPath(ctx: CanvasRenderingContext2D, x1: number, y1: number, x2: number, y2: number, tick: number) {
+  ctx.save();
+  ctx.strokeStyle = "rgba(34,211,238,0.35)";
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash([8, 6]);
+  ctx.lineDashOffset = -(tick * 0.5) % 14;
+  ctx.beginPath();
+  ctx.moveTo(x1, y1);
+  ctx.lineTo(x2, y2);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.restore();
+}
+
+function drawRobot(
+  ctx: CanvasRenderingContext2D,
+  x: number, y: number,
+  angle: number,
+  state: RobotState,
+  tick: number
+) {
+  const moving = state === "moving";
+  ctx.save();
+
+  // Outer glow
+  const grd = ctx.createRadialGradient(x, y, 0, x, y, ROBOT_RADIUS + (moving ? 34 : 20));
+  grd.addColorStop(0, moving ? "rgba(34,211,238,0.22)" : "rgba(34,211,238,0.10)");
+  grd.addColorStop(1, "transparent");
+  ctx.fillStyle = grd;
+  ctx.beginPath();
+  ctx.arc(x, y, ROBOT_RADIUS + (moving ? 34 : 20), 0, Math.PI * 2);
+  ctx.fill();
+
+  // Ping ring when moving
+  if (moving) {
+    const p = (tick % 55) / 55;
+    ctx.strokeStyle = `rgba(34,211,238,${0.55 * (1 - p)})`;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.arc(x, y, ROBOT_RADIUS + 10 + p * 30, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+
+  // Body
+  ctx.fillStyle = "#0d0d0d";
+  ctx.strokeStyle = moving ? "#22d3ee" : "rgba(34,211,238,0.55)";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(x, y, ROBOT_RADIUS, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+
+  // Direction line
+  const ex = x + Math.cos(angle) * (ROBOT_RADIUS - 3);
+  const ey = y + Math.sin(angle) * (ROBOT_RADIUS - 3);
+  ctx.strokeStyle = "#22d3ee";
+  ctx.lineWidth = 2.5;
+  ctx.lineCap = "round";
+  ctx.beginPath();
+  ctx.moveTo(x, y);
+  ctx.lineTo(ex, ey);
+  ctx.stroke();
+
+  // Center dot
+  ctx.fillStyle = "#22d3ee";
+  ctx.beginPath();
+  ctx.arc(x, y, 4, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Label
+  ctx.fillStyle = "rgba(34,211,238,0.5)";
+  ctx.font = "10px monospace";
+  ctx.textAlign = "center";
+  ctx.fillText("ROBOT", x, y + ROBOT_RADIUS + 15);
+
+  ctx.restore();
+}
+
+function drawObject(
+  ctx: CanvasRenderingContext2D,
+  obj: SimObject,
+  isTarget: boolean,
+  tick: number
+) {
+  const { x, y, radius, label, color, confidence, detected } = obj;
+  const rgb = hexToRgb(color);
+  ctx.save();
+
+  // Glow
+  if (detected) {
+    const pulse = isTarget ? 0.38 + 0.28 * Math.sin(tick * 0.12) : 0.22;
+    const grd = ctx.createRadialGradient(x, y, 0, x, y, radius + 38);
+    grd.addColorStop(0, `rgba(${rgb},${pulse})`);
+    grd.addColorStop(1, "transparent");
+    ctx.fillStyle = grd;
+    ctx.beginPath();
+    ctx.arc(x, y, radius + 38, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // Body
+  ctx.fillStyle = detected ? `rgba(${rgb},0.12)` : "rgba(255,255,255,0.04)";
+  ctx.strokeStyle = detected ? (isTarget ? color : `rgba(${rgb},0.7)`) : "rgba(255,255,255,0.12)";
+  ctx.lineWidth = isTarget ? 2.5 : detected ? 1.8 : 1;
+  ctx.beginPath();
+  ctx.arc(x, y, radius, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+
+  if (detected) {
+    // Corner bracket bounding box
+    const pad = 14;
+    const bx = x - radius - pad, by = y - radius - pad;
+    const bw = (radius + pad) * 2,  bh = (radius + pad) * 2;
+    const cs = 10;
+    ctx.strokeStyle = isTarget ? color : `rgba(${rgb},0.55)`;
+    ctx.lineWidth = isTarget ? 2 : 1.5;
+    ctx.lineCap = "round";
+    // TL
+    ctx.beginPath(); ctx.moveTo(bx, by + cs); ctx.lineTo(bx, by); ctx.lineTo(bx + cs, by); ctx.stroke();
+    // TR
+    ctx.beginPath(); ctx.moveTo(bx + bw - cs, by); ctx.lineTo(bx + bw, by); ctx.lineTo(bx + bw, by + cs); ctx.stroke();
+    // BL
+    ctx.beginPath(); ctx.moveTo(bx, by + bh - cs); ctx.lineTo(bx, by + bh); ctx.lineTo(bx + cs, by + bh); ctx.stroke();
+    // BR
+    ctx.beginPath(); ctx.moveTo(bx + bw - cs, by + bh); ctx.lineTo(bx + bw, by + bh); ctx.lineTo(bx + bw, by + bh - cs); ctx.stroke();
+
+    // Label tag background
+    const tagText = `${label}  ${confidence}%${isTarget ? "  ●" : ""}`;
+    ctx.font = "bold 10px monospace";
+    const tw = ctx.measureText(tagText).width;
+    ctx.fillStyle = `rgba(${rgb},0.12)`;
+    ctx.strokeStyle = `rgba(${rgb},0.4)`;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.rect(bx, by - 22, tw + 12, 17);
+    ctx.fill();
+    ctx.stroke();
+
+    // Label text
+    ctx.fillStyle = color;
+    ctx.textAlign = "left";
+    ctx.fillText(tagText, bx + 6, by - 9);
+  } else {
+    ctx.fillStyle = "rgba(255,255,255,0.18)";
+    ctx.font = "10px monospace";
+    ctx.textAlign = "center";
+    ctx.fillText(label, x, y + radius + 14);
+  }
+
+  ctx.restore();
+}
+
+// ── Main component ────────────────────────────────────────────────────────────
 
 export default function PlaygroundPage() {
-  const [simState, setSimState]   = useState<SimState>("idle");
-  const [scene, setScene]         = useState("Warehouse");
-  const [modelId, setModelId]     = useState("od-v2");
-  const [rules, setRules]         = useState<Rule[]>([
-    { id: 1, condition: "Bottle detected", action: "Move toward" },
-  ]);
-  const [statusIdx, setStatusIdx] = useState(0);
-  const [scanY, setScanY]         = useState(0);
-  const [tick, setTick]           = useState(0);
-  const [log, setLog]             = useState<string[]>([]);
+  const canvasRef  = useRef<HTMLCanvasElement>(null);
+  const wrapperRef = useRef<HTMLDivElement>(null);
+  const animRef    = useRef<number | null>(null);
 
-  const statusRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const tickRef   = useRef<ReturnType<typeof setInterval> | null>(null);
-  const scanRef   = useRef<ReturnType<typeof setInterval> | null>(null);
+  // All mutable sim state lives here — never stale in RAF
+  const sim = useRef({
+    robotX: 0, robotY: 0,
+    robotAngle: 0,
+    robotState: "idle" as RobotState,
+    objects: [] as SimObject[],
+    targetId: null as number | null,
+    tick: 0,
+    lastTime: 0,
+    initialized: false,
+  });
 
-  const objects   = SCENES[scene];
-  const model     = MODELS.find(m => m.id === modelId)!;
-  const isRunning = simState === "running";
-  const isActive  = simState !== "idle";
-  const target    = isActive ? findTarget(objects, rules) : null;
+  // React state drives UI only
+  const [robotState, setRobotState] = useState<RobotState>("idle");
+  const [objCount,   setObjCount]   = useState(0);
+  const [log,        setLog]        = useState<string[]>([]);
 
-  const clearAll = useCallback(() => {
-    [statusRef, tickRef, scanRef].forEach(r => {
-      if (r.current) { clearInterval(r.current); r.current = null; }
-    });
+  const addLog = useCallback((msg: string) => {
+    const t = new Date().toLocaleTimeString("en-US", { hour12: false });
+    setLog(p => [`${t}  ${msg}`, ...p].slice(0, 12));
   }, []);
 
-  const startSim = useCallback(() => {
-    if (statusRef.current) return;
-    setSimState("running");
-    setStatusIdx(0);
-    setScanY(0);
-    setLog([]);
-
-    statusRef.current = setInterval(() =>
-      setStatusIdx(p => (p + 1) % STATUS_STEPS.length), 1800);
-    tickRef.current = setInterval(() => setTick(t => t + 1), 100);
-    scanRef.current = setInterval(() =>
-      setScanY(y => (y >= 100 ? 0 : y + 1.5)), 40);
-  }, []);
-
-  const pauseSim = useCallback(() => {
-    setSimState("paused");
-    clearAll();
-  }, [clearAll]);
-
-  const resetSim = useCallback(() => {
-    clearAll();
-    setSimState("idle");
-    setStatusIdx(0);
-    setScanY(0);
-    setTick(0);
-    setLog([]);
-  }, [clearAll]);
-
-  useEffect(() => () => clearAll(), [clearAll]);
-
+  // Resize canvas + center robot on first init
   useEffect(() => {
-    if (isRunning && tick % 15 === 0 && tick > 0) {
-      const obj = objects[Math.floor(Math.random() * objects.length)];
-      const t = new Date().toLocaleTimeString("en-US", { hour12: false });
-      setLog(prev => [`${t}  ${obj.label}  ${obj.confidence}%`, ...prev].slice(0, 7));
+    const canvas  = canvasRef.current;
+    const wrapper = wrapperRef.current;
+    if (!canvas || !wrapper) return;
+
+    function resize() {
+      const { width, height } = wrapper!.getBoundingClientRect();
+      canvas!.width  = Math.floor(width);
+      canvas!.height = Math.floor(height);
+      if (!sim.current.initialized) {
+        sim.current.robotX = width / 2;
+        sim.current.robotY = height / 2;
+        sim.current.initialized = true;
+      }
     }
-  }, [tick, isRunning, objects]);
+    resize();
+    const ro = new ResizeObserver(resize);
+    ro.observe(wrapper);
+    return () => ro.disconnect();
+  }, []);
 
-  function addRule() {
-    setRules(p => [...p, { id: Date.now(), condition: CONDITIONS[0], action: ACTIONS[0] }]);
-  }
-  function updateRule(id: number, field: "condition" | "action", value: string) {
-    setRules(p => p.map(r => r.id === id ? { ...r, [field]: value } : r));
-  }
-  function removeRule(id: number) {
-    setRules(p => p.filter(r => r.id !== id));
+  // RAF draw + physics loop
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    function loop(time: number) {
+      const ctx = canvas!.getContext("2d");
+      if (!ctx) { animRef.current = requestAnimationFrame(loop); return; }
+
+      const dt = Math.min((time - sim.current.lastTime) / 1000, 0.05);
+      sim.current.lastTime = time;
+      sim.current.tick++;
+      const s   = sim.current;
+      const { width: w, height: h } = canvas!;
+
+      // ── Physics ────────────────────────────────────────────────────────────
+      if (s.robotState === "moving" && s.targetId !== null) {
+        const target = s.objects.find(o => o.id === s.targetId);
+        if (target) {
+          const dx   = target.x - s.robotX;
+          const dy   = target.y - s.robotY;
+          const dist = Math.sqrt(dx * dx + dy * dy);
+          s.robotAngle = Math.atan2(dy, dx);
+
+          if (dist > ROBOT_RADIUS + target.radius + 8) {
+            s.robotX += (dx / dist) * ROBOT_SPEED * dt;
+            s.robotY += (dy / dist) * ROBOT_SPEED * dt;
+          } else {
+            // Reached
+            s.robotState = "reached";
+            s.targetId   = null;
+            setRobotState("reached");
+            addLog(`✓ Reached: ${target.label}`);
+            setTimeout(() => {
+              sim.current.robotState = "idle";
+              setRobotState("idle");
+            }, 2000);
+          }
+        }
+      }
+
+      // ── Draw ───────────────────────────────────────────────────────────────
+      ctx.clearRect(0, 0, w, h);
+
+      // Background
+      ctx.fillStyle = "#080808";
+      ctx.fillRect(0, 0, w, h);
+      drawGrid(ctx, w, h);
+
+      // Path line robot → target
+      if (s.robotState === "moving" && s.targetId !== null) {
+        const target = s.objects.find(o => o.id === s.targetId);
+        if (target) drawPath(ctx, s.robotX, s.robotY, target.x, target.y, s.tick);
+      }
+
+      // Objects
+      s.objects.forEach(obj => drawObject(ctx, obj, obj.id === s.targetId, s.tick));
+
+      // Robot (on top)
+      drawRobot(ctx, s.robotX, s.robotY, s.robotAngle, s.robotState, s.tick);
+
+      // HUD
+      ctx.save();
+      ctx.fillStyle = "rgba(34,211,238,0.28)";
+      ctx.font = "10px monospace";
+      ctx.textAlign = "left";
+      ctx.fillText("ARTEMIS · ROS 2", 14, 20);
+      ctx.fillStyle = "rgba(255,255,255,0.1)";
+      ctx.fillText(`OBJECTS: ${s.objects.length}`, 14, 34);
+      ctx.restore();
+
+      animRef.current = requestAnimationFrame(loop);
+    }
+
+    animRef.current = requestAnimationFrame(loop);
+    return () => { if (animRef.current) cancelAnimationFrame(animRef.current); };
+  }, [addLog]);
+
+  // ── Actions ───────────────────────────────────────────────────────────────
+
+  function addObject() {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const margin = 90;
+    const x      = margin + Math.random() * (canvas.width  - margin * 2);
+    const y      = margin + Math.random() * (canvas.height - margin * 2);
+    const idx    = sim.current.objects.length % OBJECT_LABELS.length;
+    const label  = OBJECT_LABELS[idx];
+    const color  = OBJECT_COLORS[idx];
+    const conf   = Math.round(82 + Math.random() * 14);
+    const id     = Date.now();
+    const obj: SimObject = { id, x, y, radius: 14 + Math.random() * 9, label, color, confidence: conf, detected: false };
+
+    sim.current.objects = [...sim.current.objects, obj];
+    setObjCount(c => c + 1);
+    addLog(`Added: ${label} at (${Math.round(x)}, ${Math.round(y)})`);
+
+    // Auto-detect after short delay
+    setTimeout(() => {
+      sim.current.objects = sim.current.objects.map(o => o.id === id ? { ...o, detected: true } : o);
+      addLog(`Detected: ${label} — ${conf}% confidence`);
+    }, 550);
   }
 
-  const targetCx = target ? target.x + target.w / 2 : null;
-  const targetCy = target ? target.y + target.h / 2 : null;
+  function followObject() {
+    const { objects, robotX, robotY } = sim.current;
+    if (objects.length === 0) { addLog("No objects — add one first"); return; }
+
+    // Find nearest
+    let nearest = objects[0];
+    let minDist = Infinity;
+    objects.forEach(o => {
+      const d = Math.hypot(o.x - robotX, o.y - robotY);
+      if (d < minDist) { minDist = d; nearest = o; }
+    });
+
+    sim.current.targetId   = nearest.id;
+    sim.current.robotState = "moving";
+    setRobotState("moving");
+    addLog(`Following: ${nearest.label}`);
+  }
+
+  function stop() {
+    sim.current.robotState = "idle";
+    sim.current.targetId   = null;
+    setRobotState("idle");
+    addLog("Robot stopped");
+  }
+
+  function clearAll() {
+    sim.current.objects    = [];
+    sim.current.robotState = "idle";
+    sim.current.targetId   = null;
+    sim.current.robotAngle = 0;
+    sim.current.robotX     = canvasRef.current ? canvasRef.current.width  / 2 : 400;
+    sim.current.robotY     = canvasRef.current ? canvasRef.current.height / 2 : 300;
+    setRobotState("idle");
+    setObjCount(0);
+    setLog([]);
+    addLog("Canvas cleared");
+  }
+
+  const STATUS = {
+    idle:    { label: "Idle",           color: "text-zinc-400",  dot: "bg-zinc-600" },
+    moving:  { label: "Moving",         color: "text-cyan-400",  dot: "bg-cyan-400 animate-pulse" },
+    reached: { label: "Target Reached", color: "text-green-400", dot: "bg-green-400" },
+  } satisfies Record<RobotState, { label: string; color: string; dot: string }>;
+
+  const status = STATUS[robotState];
 
   return (
     <div className="flex h-screen overflow-hidden bg-[#080808]">
-      <style>{`
-        @keyframes pg-fade-in {
-          from { opacity: 0; transform: scale(0.95); }
-          to   { opacity: 1; transform: scale(1); }
-        }
-        @keyframes pg-pulse-target {
-          0%,100% { box-shadow: 0 0 8px rgba(34,211,238,.45),  inset 0 0 8px rgba(34,211,238,.06); }
-          50%      { box-shadow: 0 0 22px rgba(34,211,238,.85), inset 0 0 14px rgba(34,211,238,.10); }
-        }
-        @keyframes pg-ping-slow {
-          0%   { transform: scale(1);   opacity: .6; }
-          100% { transform: scale(2.5); opacity: 0; }
-        }
-        .pg-fade-in       { animation: pg-fade-in .25s ease-out forwards; }
-        .pg-pulse-target  { animation: pg-pulse-target 1.3s ease-in-out infinite; }
-        .pg-ping-slow     { animation: pg-ping-slow 1.6s ease-out infinite; }
-        .pg-ping-slow-2   { animation: pg-ping-slow 1.6s ease-out infinite .5s; }
-      `}</style>
 
       {/* ── Left Panel ───────────────────────────────────────────────────── */}
       <aside className="w-64 shrink-0 border-r border-[#1a1a1a] flex flex-col overflow-y-auto">
@@ -207,119 +411,96 @@ export default function PlaygroundPage() {
           <div className="flex items-center gap-2 mb-0.5">
             <svg width="14" height="14" viewBox="0 0 14 14" fill="none" className="text-cyan-400">
               <circle cx="7" cy="7" r="5.5" stroke="currentColor" strokeWidth="1.2"/>
-              <circle cx="7" cy="7" r="2"   fill="currentColor"/>
+              <circle cx="7" cy="7" r="2" fill="currentColor"/>
               <path d="M7 1.5v1M7 11.5v1M1.5 7h1M11.5 7h1" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round"/>
             </svg>
             <p className="text-sm font-medium text-white">Playground</p>
           </div>
-          <p className="text-[10px] text-zinc-600">Robot vision simulator</p>
+          <p className="text-[10px] text-zinc-600">2D robot simulation</p>
         </div>
 
-        {/* Models */}
-        <div className="border-b border-[#1a1a1a]">
-          <p className="px-4 pt-3 pb-2 text-[9px] font-mono text-zinc-600 uppercase tracking-widest">Models</p>
-          <div className="px-2 pb-2 space-y-0.5">
-            {MODELS.map(m => (
-              <button key={m.id} onClick={() => setModelId(m.id)}
-                className={`w-full flex items-center justify-between px-3 py-2.5 rounded-lg text-xs transition-all ${
-                  modelId === m.id ? "bg-white/8 text-white" : "text-zinc-500 hover:text-white hover:bg-white/4"
-                }`}
-              >
-                <div className="text-left">
-                  <p className={`text-xs font-medium ${modelId === m.id ? "text-white" : "text-zinc-400"}`}>{m.name}</p>
-                  <p className="text-[10px] text-zinc-700 mt-0.5">{m.type}</p>
-                </div>
-                <span className={`text-[10px] font-mono ${modelId === m.id ? "text-cyan-400" : "text-zinc-700"}`}>{m.accuracy}</span>
-              </button>
-            ))}
+        {/* Status card */}
+        <div className="border-b border-[#1a1a1a] px-4 py-4">
+          <p className="text-[9px] font-mono text-zinc-600 uppercase tracking-widest mb-3">Status</p>
+          <div className="flex items-center gap-3 bg-[#0d0d0d] rounded-lg border border-[#1e1e1e] px-3 py-3">
+            <div className={`h-2 w-2 rounded-full shrink-0 ${status.dot}`} />
+            <div>
+              <p className={`text-sm font-semibold ${status.color}`}>{status.label}</p>
+              <p className="text-[10px] text-zinc-700 mt-0.5 font-mono">Objects: {objCount}</p>
+            </div>
           </div>
         </div>
 
-        {/* Scenes */}
-        <div className="border-b border-[#1a1a1a]">
-          <p className="px-4 pt-3 pb-2 text-[9px] font-mono text-zinc-600 uppercase tracking-widest">Scenes</p>
-          <div className="px-2 pb-3 grid grid-cols-2 gap-1.5">
-            {Object.keys(SCENES).map(s => (
-              <button key={s} onClick={() => { setScene(s); resetSim(); }}
-                className={`rounded-lg py-2.5 text-xs font-medium transition-all ${
-                  scene === s
-                    ? "bg-cyan-400/10 border border-cyan-400/30 text-cyan-400"
-                    : "border border-[#222] text-zinc-500 hover:text-white hover:border-white/20"
-                }`}
-              >
-                {s}
-              </button>
-            ))}
-          </div>
-        </div>
+        {/* Controls */}
+        <div className="border-b border-[#1a1a1a] px-4 py-4">
+          <p className="text-[9px] font-mono text-zinc-600 uppercase tracking-widest mb-3">Controls</p>
+          <div className="space-y-2">
 
-        {/* Logic Builder */}
-        <div className="border-b border-[#1a1a1a]">
-          <div className="flex items-center justify-between px-4 pt-3 pb-2">
-            <p className="text-[9px] font-mono text-zinc-600 uppercase tracking-widest">Logic Builder</p>
-            <button onClick={addRule}
-              className="text-[10px] text-cyan-400 hover:text-white transition-colors flex items-center gap-1"
+            <button onClick={addObject}
+              className="w-full flex items-center gap-2.5 rounded-lg bg-white/5 border border-white/8 hover:bg-white/8 hover:border-white/15 px-3 py-2.5 text-sm text-white transition-all"
             >
-              <svg width="8" height="8" viewBox="0 0 8 8" fill="none">
-                <path d="M4 1v6M1 4h6" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round"/>
+              <svg width="14" height="14" viewBox="0 0 14 14" fill="none" className="text-cyan-400 shrink-0">
+                <circle cx="7" cy="7" r="5.5" stroke="currentColor" strokeWidth="1.2"/>
+                <path d="M7 4v6M4 7h6" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/>
               </svg>
-              Add
+              Add Object
+            </button>
+
+            <button onClick={followObject} disabled={robotState === "moving"}
+              className="w-full flex items-center gap-2.5 rounded-lg bg-cyan-400/10 border border-cyan-400/20 hover:bg-cyan-400/16 hover:border-cyan-400/35 px-3 py-2.5 text-sm text-cyan-400 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              <svg width="14" height="14" viewBox="0 0 14 14" fill="none" className="shrink-0">
+                <path d="M2 7h10M9 4l3 3-3 3" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round"/>
+              </svg>
+              Follow Object
+            </button>
+
+            <button onClick={stop} disabled={robotState === "idle"}
+              className="w-full flex items-center gap-2.5 rounded-lg bg-white/4 border border-white/8 hover:bg-white/8 hover:border-white/15 px-3 py-2.5 text-sm text-zinc-300 transition-all disabled:opacity-30 disabled:cursor-not-allowed"
+            >
+              <svg width="14" height="14" viewBox="0 0 14 14" fill="none" className="text-zinc-500 shrink-0">
+                <rect x="3.5" y="3.5" width="7" height="7" rx="1" stroke="currentColor" strokeWidth="1.3"/>
+              </svg>
+              Stop
+            </button>
+
+            <button onClick={clearAll}
+              className="w-full flex items-center gap-2.5 rounded-lg border border-[#1e1e1e] hover:bg-white/4 hover:border-white/10 px-3 py-2.5 text-sm text-zinc-600 hover:text-zinc-400 transition-all"
+            >
+              <svg width="14" height="14" viewBox="0 0 14 14" fill="none" className="shrink-0">
+                <path d="M2 4h10M5.5 4V2.5h3V4M10.5 4l-.6 7A1 1 0 019 12H5a1 1 0 01-1-.9L3.5 4" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round"/>
+              </svg>
+              Clear All
             </button>
           </div>
-          <div className="px-2 pb-3 space-y-2">
-            {rules.map(rule => (
-              <div key={rule.id} className="rounded-lg border border-[#1e1e1e] bg-[#0c0c0c] p-2.5 space-y-2">
-                <div className="flex items-center justify-between">
-                  <span className="text-[9px] font-mono text-zinc-700 uppercase tracking-wider">Rule</span>
-                  {rules.length > 1 && (
-                    <button onClick={() => removeRule(rule.id)}
-                      className="text-zinc-700 hover:text-red-400 transition-colors leading-none text-sm"
-                    >×</button>
-                  )}
-                </div>
-                <div className="space-y-1.5">
-                  <div>
-                    <p className="text-[9px] text-zinc-700 mb-1 font-mono">IF</p>
-                    <select value={rule.condition}
-                      onChange={e => updateRule(rule.id, "condition", e.target.value)}
-                      className="w-full rounded-md bg-[#141414] border border-[#252525] text-[11px] text-zinc-300 px-2 py-1.5 outline-none focus:border-white/20"
-                    >
-                      {CONDITIONS.map(c => <option key={c}>{c}</option>)}
-                    </select>
-                  </div>
-                  <div>
-                    <p className="text-[9px] text-zinc-700 mb-1 font-mono">THEN</p>
-                    <select value={rule.action}
-                      onChange={e => updateRule(rule.id, "action", e.target.value)}
-                      className="w-full rounded-md bg-[#141414] border border-[#252525] text-[11px] text-zinc-300 px-2 py-1.5 outline-none focus:border-white/20"
-                    >
-                      {ACTIONS.map(a => <option key={a}>{a}</option>)}
-                    </select>
-                  </div>
-                </div>
-                {/* Rule summary pill */}
-                <div className="flex items-center gap-1 pt-0.5">
-                  <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-cyan-400/8 border border-cyan-400/15 text-cyan-400/70">
-                    {rule.condition.split(" ")[0]}
-                  </span>
-                  <svg width="8" height="8" viewBox="0 0 8 8" fill="none" className="text-zinc-700">
-                    <path d="M1 4h6M5 2l2 2-2 2" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round"/>
-                  </svg>
-                  <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-white/4 border border-white/8 text-zinc-500">
-                    {rule.action}
-                  </span>
-                </div>
+        </div>
+
+        {/* Legend */}
+        <div className="border-b border-[#1a1a1a] px-4 py-4">
+          <p className="text-[9px] font-mono text-zinc-600 uppercase tracking-widest mb-3">Legend</p>
+          <div className="space-y-2.5">
+            {[
+              { color: "#22d3ee", label: "Robot" },
+              { color: "rgba(255,255,255,0.2)", label: "Undetected object" },
+              { color: "#22d3ee", label: "Detected (bounding box)" },
+              { color: "#22d3ee", label: "Target (nearest)" },
+            ].map((item, i) => (
+              <div key={i} className="flex items-center gap-2.5">
+                <div className="h-2 w-2 rounded-full shrink-0" style={{ backgroundColor: item.color }} />
+                <span className="text-[11px] text-zinc-500">{item.label}</span>
               </div>
             ))}
           </div>
         </div>
 
-        {/* Detection Log */}
+        {/* System log */}
         <div className="flex-1 flex flex-col min-h-0">
-          <p className="px-4 pt-3 pb-2 text-[9px] font-mono text-zinc-600 uppercase tracking-widest shrink-0">Detection Log</p>
+          <p className="px-4 pt-4 pb-2 text-[9px] font-mono text-zinc-600 uppercase tracking-widest shrink-0">
+            System Log
+          </p>
           <div className="px-3 pb-3 flex-1 overflow-y-auto space-y-1">
             {log.length === 0 ? (
-              <p className="text-[10px] text-zinc-800 font-mono">No detections yet...</p>
+              <p className="text-[10px] text-zinc-800 font-mono px-1">Awaiting input...</p>
             ) : log.map((entry, i) => (
               <p key={i} className={`text-[10px] font-mono leading-relaxed ${i === 0 ? "text-zinc-400" : "text-zinc-700"}`}>
                 {entry}
@@ -335,219 +516,66 @@ export default function PlaygroundPage() {
         {/* Top bar */}
         <div className="shrink-0 h-11 border-b border-[#1a1a1a] flex items-center justify-between px-5">
           <div className="flex items-center gap-2.5">
-            <span className="text-xs font-medium text-zinc-400">{scene}</span>
-            <span className="text-zinc-800 text-xs">·</span>
-            <span className="text-xs text-zinc-600">{model.name}</span>
-            <span className="text-zinc-800 text-xs">·</span>
-            <span className="text-[10px] font-mono text-zinc-700">{objects.length} objects</span>
+            <span className="text-xs font-medium text-zinc-400">2D Simulation</span>
+            <span className="text-zinc-800">·</span>
+            <span className="text-xs text-zinc-600">Object Detection Mode</span>
           </div>
           <div className="flex items-center gap-4">
-            <span className="text-[10px] font-mono text-zinc-700">CONF: 0.75</span>
-            <span className="text-[10px] font-mono text-zinc-700">30 fps</span>
+            <span className="text-[10px] font-mono text-zinc-700">60 fps</span>
             <div className="flex items-center gap-1.5">
-              <div className={`h-1.5 w-1.5 rounded-full transition-colors ${
-                isRunning ? "bg-red-500 animate-pulse" : simState === "paused" ? "bg-amber-500" : "bg-zinc-700"
-              }`} />
-              <span className={`text-[10px] font-mono ${
-                isRunning ? "text-red-400" : simState === "paused" ? "text-amber-400" : "text-zinc-700"
-              }`}>
-                {isRunning ? "LIVE" : simState === "paused" ? "PAUSED" : "IDLE"}
+              <div className={`h-1.5 w-1.5 rounded-full ${robotState === "moving" ? "bg-cyan-400 animate-pulse" : "bg-zinc-700"}`} />
+              <span className={`text-[10px] font-mono ${robotState === "moving" ? "text-cyan-400" : "text-zinc-700"}`}>
+                {robotState === "moving" ? "ACTIVE" : "STANDBY"}
               </span>
             </div>
           </div>
         </div>
 
         {/* Canvas */}
-        <div className="flex-1 relative overflow-hidden" style={{ background: SCENE_BG[scene] }}>
-
-          {/* Grid */}
-          <div className="absolute inset-0 pointer-events-none" style={{
-            backgroundImage: `linear-gradient(rgba(34,211,238,.03) 1px,transparent 1px),linear-gradient(90deg,rgba(34,211,238,.03) 1px,transparent 1px)`,
-            backgroundSize: "48px 48px",
-          }} />
-
-          {/* Perspective floor lines */}
-          <svg className="absolute inset-0 w-full h-full pointer-events-none" viewBox="0 0 100 100" preserveAspectRatio="none">
-            <line x1="0" y1="75" x2="100" y2="75" stroke="#22d3ee" strokeWidth="0.08" strokeOpacity="0.18"/>
-            {[-20,-10,0,10,20,30,40,50,60,70,80,90,100,110,120].map((x, i) => (
-              <line key={i} x1={x} y1="100" x2="50" y2="75"
-                stroke="#22d3ee" strokeWidth="0.05" strokeOpacity="0.08"/>
-            ))}
-          </svg>
-
-          {/* Scan line */}
-          {isRunning && (
-            <div className="absolute left-0 right-0 pointer-events-none z-10" style={{
-              top: `${scanY}%`,
-              height: "1px",
-              background: "linear-gradient(90deg, transparent 0%, rgba(34,211,238,.5) 20%, rgba(34,211,238,.8) 50%, rgba(34,211,238,.5) 80%, transparent 100%)",
-              boxShadow: "0 0 10px rgba(34,211,238,.35), 0 0 2px rgba(34,211,238,.6)",
-            }} />
-          )}
-
-          {/* Bounding boxes */}
-          {isActive && objects.map(obj => {
-            const color = CLS_COLOR[obj.cls] ?? "#22d3ee";
-            const isTarget = target?.id === obj.id;
-            return (
-              <div key={obj.id} className={`absolute pg-fade-in ${isTarget ? "pg-pulse-target" : ""}`}
-                style={{
-                  left: `${obj.x}%`, top: `${obj.y}%`,
-                  width: `${obj.w}%`, height: `${obj.h}%`,
-                  border: `1px solid ${color}`,
-                  backgroundColor: `${color}07`,
-                  boxShadow: isTarget
-                    ? `0 0 8px ${color}50, inset 0 0 8px ${color}08`
-                    : `0 0 4px ${color}30`,
-                }}
-              >
-                {/* Corner brackets */}
-                <div style={{ position:"absolute",top:-1,left:-1,width:8,height:8,borderTop:`2px solid ${color}`,borderLeft:`2px solid ${color}` }}/>
-                <div style={{ position:"absolute",top:-1,right:-1,width:8,height:8,borderTop:`2px solid ${color}`,borderRight:`2px solid ${color}` }}/>
-                <div style={{ position:"absolute",bottom:-1,left:-1,width:8,height:8,borderBottom:`2px solid ${color}`,borderLeft:`2px solid ${color}` }}/>
-                <div style={{ position:"absolute",bottom:-1,right:-1,width:8,height:8,borderBottom:`2px solid ${color}`,borderRight:`2px solid ${color}` }}/>
-
-                {/* Label */}
-                <div className="absolute left-0 flex items-center gap-1 px-1.5 py-0.5 whitespace-nowrap"
-                  style={{
-                    top: "-1.4rem",
-                    backgroundColor: `${color}18`,
-                    border: `1px solid ${color}50`,
-                    borderBottom: "none",
-                  }}
-                >
-                  {isTarget && <div className="h-1 w-1 rounded-full animate-pulse" style={{ backgroundColor: color }} />}
-                  <span className="text-[9px] font-mono" style={{ color }}>
-                    {obj.label} {obj.confidence}%
-                  </span>
-                </div>
-              </div>
-            );
-          })}
-
-          {/* Arrow SVG — robot to target */}
-          {isRunning && targetCx !== null && targetCy !== null && (
-            <svg className="absolute inset-0 w-full h-full pointer-events-none z-20"
-              viewBox="0 0 100 100" preserveAspectRatio="none"
-            >
-              <defs>
-                <marker id="ah" markerWidth="5" markerHeight="5" refX="2.5" refY="2.5" orient="auto">
-                  <path d="M0,0 L0,5 L5,2.5 z" fill="#22d3ee" fillOpacity="0.8"/>
-                </marker>
-              </defs>
-              <line x1={ROBOT_POS[0]} y1={ROBOT_POS[1]} x2={targetCx} y2={targetCy}
-                stroke="#22d3ee" strokeWidth="0.25" strokeOpacity="0.2" strokeDasharray="1.5 1.5"/>
-              <line x1={ROBOT_POS[0]} y1={ROBOT_POS[1]} x2={targetCx} y2={targetCy}
-                stroke="#22d3ee" strokeWidth="0.4" strokeOpacity="0.75" markerEnd="url(#ah)"/>
-            </svg>
-          )}
-
-          {/* Robot indicator */}
-          <div className="absolute z-30 pointer-events-none"
-            style={{ left: `${ROBOT_POS[0]}%`, top: `${ROBOT_POS[1]}%`, transform: "translate(-50%,-50%)" }}
-          >
-            {isRunning && (
-              <>
-                <div className="pg-ping-slow absolute inset-0 rounded-full border border-cyan-400/30" style={{ margin: "-8px" }} />
-                <div className="pg-ping-slow-2 absolute inset-0 rounded-full border border-cyan-400/20" style={{ margin: "-14px" }} />
-              </>
-            )}
-            <div className={`relative h-5 w-5 rounded-full border flex items-center justify-center ${
-              isRunning ? "border-cyan-400/80 bg-cyan-400/15" : "border-zinc-600/50 bg-zinc-800/30"
-            }`}>
-              <div className={`h-2 w-2 rounded-full ${isRunning ? "bg-cyan-400" : "bg-zinc-600"}`} />
-            </div>
-            <p className="text-[7px] font-mono text-cyan-400/50 text-center mt-1 tracking-widest">BOT</p>
-          </div>
-
-          {/* HUD — top-left */}
-          <div className="absolute top-4 left-4 pointer-events-none space-y-1">
-            <p className="text-[9px] font-mono text-cyan-400/40 tracking-widest">{model.name.toUpperCase()}</p>
-            <p className="text-[9px] font-mono text-zinc-800">ARTEMIS · ROS 2</p>
-          </div>
-
-          {/* HUD — top-right bracket decoration */}
-          <div className="absolute top-4 right-4 pointer-events-none">
-            <div className="relative w-14 h-10">
-              <div className="absolute top-0 left-0 w-4 h-4 border-t border-l border-cyan-400/20"/>
-              <div className="absolute top-0 right-0 w-4 h-4 border-t border-r border-cyan-400/20"/>
-              <div className="absolute bottom-0 left-0 w-4 h-4 border-b border-l border-cyan-400/20"/>
-              <div className="absolute bottom-0 right-0 w-4 h-4 border-b border-r border-cyan-400/20"/>
-            </div>
-          </div>
-
-          {/* Status bar — bottom of canvas */}
-          <div className="absolute bottom-0 inset-x-0 px-5 py-3 flex items-center justify-between pointer-events-none"
-            style={{ background: "linear-gradient(to top, rgba(8,8,8,.95) 0%, transparent 100%)" }}
-          >
-            <div className="flex items-center gap-2">
-              {isRunning && <div className="h-1.5 w-1.5 rounded-full bg-cyan-400 animate-pulse" />}
-              {simState === "paused" && <div className="h-1.5 w-1.5 rounded-full bg-amber-400" />}
-              <span className="text-xs font-mono text-zinc-400">
-                {simState === "idle"
-                  ? "Ready — press Start to begin simulation"
-                  : simState === "paused"
-                  ? "Simulation paused"
-                  : STATUS_STEPS[statusIdx]}
-              </span>
-            </div>
-            {isActive && target && (
-              <div className="flex items-center gap-2">
-                <span className="text-[9px] font-mono text-zinc-700">TARGET</span>
-                <span className="text-[9px] font-mono text-cyan-400">{target.label}</span>
-                <svg width="8" height="8" viewBox="0 0 8 8" fill="none" className="text-zinc-700">
-                  <path d="M1 4h6M5 2l2 2-2 2" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round"/>
-                </svg>
-                <span className="text-[9px] font-mono text-zinc-500">{rules[0]?.action}</span>
-              </div>
-            )}
-          </div>
+        <div ref={wrapperRef} className="flex-1 relative overflow-hidden">
+          <canvas ref={canvasRef} className="absolute inset-0" />
         </div>
 
         {/* Controls bar */}
         <div className="shrink-0 border-t border-[#1a1a1a] px-5 py-3 flex items-center gap-2.5">
-          {simState !== "running" ? (
-            <button onClick={startSim}
-              className="flex items-center gap-2 rounded-lg bg-cyan-400 hover:bg-cyan-300 text-black px-4 py-2 text-xs font-semibold transition-colors"
-            >
-              <svg width="9" height="9" viewBox="0 0 9 9" fill="none">
-                <path d="M2 1l6 3.5L2 8V1z" fill="currentColor"/>
-              </svg>
-              Start Simulation
-            </button>
-          ) : (
-            <button onClick={pauseSim}
-              className="flex items-center gap-2 rounded-lg border border-amber-400/30 bg-amber-400/8 hover:bg-amber-400/15 text-amber-400 px-4 py-2 text-xs font-semibold transition-colors"
-            >
-              <svg width="9" height="9" viewBox="0 0 9 9" fill="none">
-                <rect x="1" y="1" width="2.5" height="7" rx="0.5" fill="currentColor"/>
-                <rect x="5.5" y="1" width="2.5" height="7" rx="0.5" fill="currentColor"/>
-              </svg>
-              Pause
-            </button>
-          )}
-
-          <button onClick={resetSim}
-            className="flex items-center gap-2 rounded-lg border border-[#2a2a2a] text-zinc-500 hover:text-white hover:border-white/20 px-4 py-2 text-xs font-medium transition-colors"
+          <button onClick={addObject}
+            className="flex items-center gap-2 rounded-lg bg-white/5 border border-white/10 hover:bg-white/8 hover:border-white/20 px-4 py-2 text-xs font-medium text-white transition-colors"
           >
             <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
-              <path d="M9 5A4 4 0 1 1 5.5 1.1" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/>
-              <path d="M5.5 1.1L7 3l-2 1" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round"/>
+              <circle cx="5" cy="5" r="4" stroke="currentColor" strokeWidth="1.3"/>
+              <path d="M5 2.5v5M2.5 5h5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/>
             </svg>
-            Reset
+            Add Object
           </button>
 
-          {/* Object legend */}
-          {isActive && (
-            <div className="ml-auto flex items-center gap-3 flex-wrap">
-              {objects.map(obj => (
-                <div key={obj.id} className="flex items-center gap-1.5">
-                  <div className="h-2 w-2 rounded-sm" style={{ backgroundColor: CLS_COLOR[obj.cls] }}/>
-                  <span className="text-[10px] font-mono text-zinc-600">{obj.label}</span>
-                </div>
-              ))}
-            </div>
-          )}
+          <button onClick={followObject} disabled={robotState === "moving"}
+            className="flex items-center gap-2 rounded-lg bg-cyan-400 hover:bg-cyan-300 disabled:opacity-40 disabled:cursor-not-allowed px-4 py-2 text-xs font-semibold text-black transition-colors"
+          >
+            <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
+              <path d="M1 5h8M6 2l3 3-3 3" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round"/>
+            </svg>
+            Follow Object
+          </button>
+
+          <button onClick={stop} disabled={robotState === "idle"}
+            className="flex items-center gap-2 rounded-lg border border-[#2a2a2a] text-zinc-400 hover:text-white hover:border-white/20 disabled:opacity-30 disabled:cursor-not-allowed px-4 py-2 text-xs font-medium transition-colors"
+          >
+            <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
+              <rect x="2.5" y="2.5" width="5" height="5" rx="0.5" stroke="currentColor" strokeWidth="1.3"/>
+            </svg>
+            Stop
+          </button>
+
+          <button onClick={clearAll}
+            className="flex items-center gap-2 rounded-lg border border-[#1e1e1e] text-zinc-600 hover:text-zinc-400 hover:border-white/10 px-4 py-2 text-xs font-medium transition-colors"
+          >
+            Clear All
+          </button>
+
+          <div className="ml-auto flex items-center gap-2">
+            <div className={`h-1.5 w-1.5 rounded-full ${status.dot}`} />
+            <span className={`text-xs font-mono ${status.color}`}>{status.label}</span>
+          </div>
         </div>
       </div>
     </div>
